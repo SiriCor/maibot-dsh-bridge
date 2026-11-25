@@ -36,6 +36,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import uuid
 import zipfile
 from pathlib import Path
 from typing import Any, Literal, Optional
@@ -203,8 +204,10 @@ class DshBridgePlugin(MaiBotPlugin):
         self._cpu_prev: dict[int, float] = {}
         self._tasks: dict[str, dict[str, Any]] = {}
         self._scheduler_running = True
-        self._load_tasks()
-        asyncio.create_task(self._scheduler_loop())
+        self._schedule_wakeup = asyncio.Event()
+        self._scheduled_runs: dict[str, asyncio.Task[None]] = {}
+        await asyncio.to_thread(self._load_tasks)
+        self._scheduler_task = asyncio.create_task(self._scheduler_loop())
         self.ctx.logger.info(
             "麦麦×dsh 桥插件已加载 (command=%s, timeout=%s~%s, display=%s)",
             self.config.dsh.command,
@@ -215,6 +218,12 @@ class DshBridgePlugin(MaiBotPlugin):
 
     async def on_unload(self) -> None:
         self._scheduler_running = False
+        self._scheduler_task.cancel()
+        await asyncio.gather(self._scheduler_task, return_exceptions=True)
+        runs = tuple(self._scheduled_runs.values())
+        for run in runs:
+            run.cancel()
+        await asyncio.gather(*runs, return_exceptions=True)
         pid = self._current_pid
         if pid:
             await asyncio.to_thread(self._kill_tree, pid)
@@ -331,21 +340,45 @@ class DshBridgePlugin(MaiBotPlugin):
         return None
 
     async def _scheduler_loop(self) -> None:
-        """后台调度循环：每 20s 扫描到期任务并触发。"""
+        """扫描到期任务，由独立协程执行或提交。"""
         while self._scheduler_running:
+            self._schedule_wakeup.clear()
             try:
-                now = time.time()
-                due = [t for t in list(self._tasks.values()) if float(t.get("next_at") or 0) and float(t["next_at"]) <= now]
-                for task in due:
-                    try:
-                        await self._fire_task(task)
-                    except Exception:  # noqa: BLE001
-                        self.ctx.logger.warning("触发定时任务失败", exc_info=True)
+                self._dispatch_due_tasks(time.time())
             except Exception:  # noqa: BLE001
                 self.ctx.logger.warning("调度循环异常", exc_info=True)
-            await asyncio.sleep(10)
+            try:
+                await asyncio.wait_for(self._schedule_wakeup.wait(), timeout=10)
+            except TimeoutError:
+                pass
+
+    def _dispatch_due_tasks(self, now: float) -> None:
+        if self._scheduled_runs:
+            return
+        due = []
+        for task_id, task in self._tasks.items():
+            if task_id in self._scheduled_runs:
+                continue
+            next_at = float(task.get("next_at") or 0)
+            if 0 < next_at <= now:
+                due.append((next_at, task_id))
+        if due:
+            _, task_id = min(due)
+            self._scheduled_runs[task_id] = asyncio.create_task(self._run_scheduled_task(task_id))
+
+    async def _run_scheduled_task(self, task_id: str) -> None:
+        try:
+            task = self._tasks.get(task_id)
+            if task is not None:
+                await self._fire_task(task)
+        except Exception:  # noqa: BLE001
+            self.ctx.logger.warning("触发定时任务失败", exc_info=True)
+        finally:
+            self._scheduled_runs.pop(task_id, None)
+            self._schedule_wakeup.set()
 
     async def _fire_task(self, task: dict[str, Any]) -> None:
+        task_id = str(task["id"])
         stream_id = str(task.get("stream_id") or "")
         prompt = str(task.get("prompt") or "")
         ctx = task.get("ctx") or {}
@@ -356,15 +389,18 @@ class DshBridgePlugin(MaiBotPlugin):
             self._save_tasks()
             self.ctx.logger.info("定时任务「%s」因忙碌顺延", title)
             return
+        self._running = True
         try:
             await self.ctx.send.text(f"⏰ 定时任务「{title}」触发：{prompt[:60]}", stream_id)
         except Exception:  # noqa: BLE001
             pass
-        self._running = True
         try:
             await self._run_and_report(prompt, stream_id, int(task.get("timeout") or self.config.dsh.timeout_default), ctx)
         except Exception:  # noqa: BLE001
             self.ctx.logger.warning("定时任务执行失败", exc_info=True)
+            self._running = False
+        if self._tasks.get(task_id) is not task:
+            return
         trigger = task.get("trigger") or {}
         kind = str(trigger.get("kind") or "")
         if kind == "every":
@@ -372,7 +408,7 @@ class DshBridgePlugin(MaiBotPlugin):
         elif kind == "cron":
             task["next_at"] = self._compute_next(trigger, time.time())
         else:
-            self._tasks.pop(str(task.get("id")), None)
+            self._tasks.pop(task_id, None)
         self._save_tasks()
 
     def _parse_schedule(self, after_seconds: Any, every_seconds: Any, at: Any, cron: Any = None) -> Optional[dict[str, Any]]:
@@ -402,7 +438,7 @@ class DshBridgePlugin(MaiBotPlugin):
         if not trigger:
             return None
         next_at = trigger.pop("next_at")
-        task_id = "st_" + time.strftime("%Y%m%d%H%M%S") + "_" + str(int(time.time() * 1000) % 1000)
+        task_id = "st_" + uuid.uuid4().hex
         self._tasks[task_id] = {
             "id": task_id,
             "title": title,
@@ -415,6 +451,7 @@ class DshBridgePlugin(MaiBotPlugin):
             "created_at": time.time(),
         }
         self._save_tasks()
+        self._schedule_wakeup.set()
         return task_id
 
     def _schedule_requests_dir(self, stream_id: str) -> Path:
