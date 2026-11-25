@@ -59,6 +59,18 @@ class ScheduleDispatchTests(IsolatedAsyncioTestCase):
         await self.plugin._scheduled_runs["earlier"]
         self.plugin._fire_task.assert_not_awaited()
 
+    async def test_desktop_submissions_are_bounded_and_deduplicated(self):
+        self.plugin.config.desktop.enabled = True
+        for index in range(5):
+            task_id = f"desktop-{index}"
+            self.plugin._tasks[task_id] = {"id": task_id, "next_at": index + 1}
+        self.plugin._fire_task = AsyncMock()
+        self.plugin._dispatch_due_tasks(30)
+        self.plugin._dispatch_due_tasks(30)
+        self.assertEqual(list(self.plugin._scheduled_runs), [f"desktop-{index}" for index in range(4)])
+        await asyncio.gather(*self.plugin._scheduled_runs.values())
+        self.assertEqual(self.plugin._fire_task.await_count, 4)
+
     async def test_cancelled_recurring_task_is_not_rescheduled_after_execution(self):
         task = self.plugin._tasks["earlier"]
         task["trigger"] = {"kind": "every", "seconds": 60}

@@ -1,25 +1,37 @@
 # 麦麦×dsh 桥（maibot-dsh-bridge）
 
-把 [DeepSeek Harness (dsh)](https://deepseek.com/harness/) 接入麦麦：麦麦用一句话下单，dsh 在服务器上把活干完——过程以**合并转发**回传，结果落成文件、回灌麦麦上下文，产出的文件**打包发回群**，还能**定时自排班**。
-
-## 兼容性
-
-实测环境（manifest 声明范围据此填写，未验证的版本不虚标）：
-
-- **MaiBot 宿主**：1.2.3 实测通过；声明范围 `1.2.0 ~ 1.2.99`。
-- **maibot-plugin-sdk**：2.8.0 实测通过；声明范围 `2.0.0 ~ 2.8.99`。
-- **Python**：3.12+。Windows Server 2022 / Windows 10+ 已验证；类 Unix 为实验性支持。
-
-超出声明范围（如宿主 2.x、SDK 2.9+）未经实测，不保证可用。
+把 [DeepSeek Harness (dsh)](https://deepseek.com/harness/) 接入麦麦：麦麦用一句话下单，dsh 在服务器上把活干完——执行期间静默，完成后直接发送最终结果与交付文件，并记录到麦麦上下文，还能**定时自排班**。
 
 ## 功能
 
-- **命令** `/dsh [--timeout 秒] <任务>`：把任务外包给 dsh 在后台执行，命令立即回执。
+- **命令** `/dsh [--timeout 秒] <任务>`：把任务外包给 dsh 在后台执行，只在提交失败时显示错误；成功结果稍后由通知通道返回。
 - **工具** `dsh_run`：麦麦（Planner）在聊天中判断「这活该外包」时自主调用。
 - **工具** `schedule_task` / `schedule_list` / `schedule_update` / `schedule_cancel`：让麦麦建 / 看 / 改 / 删**定时任务**。
-- **交付物**：dsh 用 `present` 声明的文件，桥自动打包发回当前群（单文件直发、多文件 zip）。
+- **交付物**：dsh 用 `present` 声明的文件，桥发送回当前聊天；图片直接发送，其他文件通过 NapCat 上传。
 
-## 两轮协议：时长由 dsh 自己定
+## 桌面模式：下单与通知解耦
+
+MaiBot 的 `dsh_run` 或 `/dsh` 只负责提交任务。宿主将任务落盘后立即返回内部任务编号（HTTP 202），不再保持连接等待最终答案。可继续提交任务，由 DSH 顺序执行。执行超时仍限制单个任务的资源占用，与提交连接的 10 秒超时独立。
+
+DSH 完成后把最终文字、`present` 文件和原聊天路由存入独立通知队列。MaiBot 插件每 2 秒领取一次，先发送成果文件，再通过自身 replyer 模型，使用当前人设和回复风格组织一条自然回复。DSH 的结果只作为事实依据，不会原样作为守岸人的发言；不唤醒 Planner 再规划或调用工具。文件也可以作为唯一成果。回执生成失败会保留通知并记录错误，禁止退回 DSH 原文发送；已生成回执落盘，重试不再次生成或重复已发送部分。
+
+通知成功发送后才确认领取。MaiBot 离线、重启或提交连接断开不会取消 DSH 任务；未领取结果保留在宿主 `state/tasks/`。发送进度保存到插件数据目录的 `desktop_delivery_progress.json`，确认领取失败可续传。发送成功与本地进度写入之间若恰好崩溃，仍可能重复最后一段；不宣称跨 QQ 和本地文件实现了严格一次投递。宿主重启时，排队任务继续执行，执行中任务标记中断，避免自动重复有副作用的操作。
+
+宿主源码在 `desktop_host/`，需将 `index.js`、`async_tasks.js`、`workspace_rules.js` 与 `AGENT.md` 一同部署到 DSH 的桥接目录，加载 `index.js`，保留原有 workspaceRoot、senderId、tokenFile、stateDir、模型配置；设置 `reasoningEffort: low`。`endpoint.json` 的协议版本为 2。升级运行中的宿主时使用独立版本的模块文件名，避免旧模块缓存；若改变辅助模块或规则资源文件名，也要同步更新入口的相对路径。MaiBot 插件升级后需重载，不能继续使用旧 `/run` 客户端。
+
+宿主会在会话工作目录维护 `AGENT.md`，并将同一份固定规则同步到 DSH 原生读取的 `AGENTS.md` 管理区。管理区以 `MAIBOT_BRIDGE_RULES_START/END` 为界，更新时保留用户原有内容；损坏的边界直接报错，不覆盖。固定工作目录在宿主加载时准备规则，分流目录在创建会话前准备规则。每次实际提交只包含 `【MaiBot桥接任务】 delivery=...` 和用户任务，不再重复整段身份、输出和交付提示词。普通成果文本仍由 MaiBot 按人设组织，规则文件不代替这一步。
+
+所有接口只监听 `127.0.0.1`，沿用本机 token：
+
+- `POST /.maibot-desktop-bridge/tasks`：任务落盘后返回 `{status: "accepted", jobId}`。
+- `GET /.maibot-desktop-bridge/notifications`：领取一个最终通知，领取不会删除；无结果时返回 `notification: null`。
+- `POST /.maibot-desktop-bridge/notifications/<jobId>/ack`：确认已发送，删除通知；重复确认安全。
+
+`dsh_run.delivery` 明确区分收件关系：`maibot` 返回普通任务结果；`to_assistant` 表示用户让泰缇斯对守岸人说话，回执以“泰缇斯回复我说”标明来源；`qq` 用于用户明确说“让泰提斯／泰缇斯／Tethys 系统发给我、把截图或文件发给我、回复我”，不需要用户知道或说出 notify_qq 工具名。DSH 必须用 notify_qq 发送内容与文件，随后独立通知守岸人发送状态；守岸人不再重复投递成果。只 present、未成功交给 QQ 通道发送的任务不能标成直发完成。普通桥接和回复守岸人的任务会在该任务执行期间限制 `notify_qq`、`send_to_qq`，不会影响其他 DSH 会话。
+
+QQ 直发需要真实 QQ 对话绑定，不能把 MaiBot 会话 ID 当成绑定。宿主读取 `notify_qq` 的真实执行结果，区分已发送与已排队，MaiBot 只生成简短确认，不复述 DSH 的执行汇报和已发送正文，也不重复发送已交给 QQ 的同一文件。仅有模型声称发送成功不能当作成功凭证。
+
+## CLI 模式：两轮协议，时长由 dsh 自己定
 
 派活方（麦麦）给的秒数只作**参考建议**，真正决定「做什么、花多久」的是 dsh：
 
@@ -29,14 +41,21 @@
 
 这样派活方定「愿望」、干活方定「现实」，既避免拍一个过紧的死超时，也逼 dsh「先想清楚怎么做」。
 
-## 结果回传（四段）
+## 结果回传（只回答结果）
 
-1. **过程**：合并转发卡片，按「工具调用 / 输出 / 最终」分节点，连续输出合并、工具节点精简为「工具名 + 一行参数 + 耗时」。
-2. **结果文件**：完成后把最终文本写成 `result-<时间>.md`，经 **NapCat** 上传到当前群 / 私聊。
-3. **交付物**：dsh 通过 `present` 声明的文件，桥收集后打包（单文件直发、多文件 zip），一并发回群，并回一句「📦 交付物（N 个）：…」。
-4. **回灌**：把结果摘要通过 `maisaka.context.append` 注入麦麦上下文（长度受 `context_inject_chars` 限制），让它「知道」dsh 查回了什么。
+默认将最终回执在本机渲染为 Markdown 图片卡片，支持标题、加粗、列表、引用、表格、链接和代码块；长内容自动分页。附件仍单独发送，聊天上下文保留原始文字。图片发送或渲染失败时保留通知并记录错误，不会误标已发送。
 
-> ⚠️ **适配器边界**：结果文件 / 交付物上传依赖 **NapCat** 的文件接口（`adapter.napcat.file.upload_group_file` / `upload_private_file`）。**非 NapCat 适配器**（如 SnowLuma）会自动回退为转发卡片，不发文件。
+需要复制正文时，将 `[dsh].receipt_format` 设为 `"text"`；默认值为 `"card"`。旧 `display_mode` 不控制新回执。修改插件配置后需重载插件。Windows 使用微软雅黑，Linux 需安装 Noto Sans CJK 字体；渲染不访问远程图片或执行 HTML。
+
+此设置控制 MaiBot 桥接回执。`delivery=qq` 时 DSH 经 `notify_qq` 直接发送的正文由独立 QQ 通道控制，本插件只将发送状态确认为卡片，不重复投递正文。
+
+- CLI 与桌面模式均静默执行，不发送接单确认、过程转发、完成通知或重复的结果文本文件。旧 `display_mode` 设置不再控制回传形态。
+- 最终正文默认以 Markdown 图片卡片发送，可选纯文本；要求只回答任务结果，遵循用户指定的语言、格式和必要细节，不添加寒暄、人设台词、无关解释和结尾邀约。失败时报告实际原因。
+- 当前聊天的文件交付由 MaiBot 的独立通知循环负责。DSH 生成文件后调用 `present` 并结束，不再查找 QQ 发送接口；单纯截图无需读取图片内容。宿主任务超时等已知失败保留具体原因，任务编号和 DSH 会话 ID 只用于内部排查。
+- 图片直接发送；其他交付文件经 NapCat 上传。CLI 的 `present` 文件仍受工作区路径检查与数量限制。
+- 工具提交结果明确标记为后台执行，并要求麦麦静默等待；结果摘要回灌时标记已发送，避免再次转述或追加闲聊。这些模型回复约束仍需实际对话验证。
+
+> 非图片文件上传依赖 NapCat 文件接口；其他适配器不支持此上传方式。
 
 ## 定时任务（桥内置调度）
 
@@ -98,7 +117,7 @@ dsh 的能力按「plugin bundle」叠进 profile（改 `$DSH_HOME/profiles/<名
 | `[dsh].context_inject_chars` | 回灌进麦麦上下文的结果摘要上限（默认 600，越小越省上下文） |
 | `[dsh].deliver_max_files` | 单次任务最多打包发送的交付物数量（默认 8） |
 | `[dsh].allow_self_schedule` | 是否允许 dsh 经 schedule-requests 自建定时任务（默认开；关则禁止） |
-| `[dsh].display_mode` | `forward`（合并转发）或 `text` |
+| `[dsh].display_mode` | 旧配置保留，当前统一只发送结果 |
 | `[dsh].permission_mode` | dsh 沙箱模式：`danger-full-access`（默认，git/npm 可用）/ `workspace-write` / `read-only` |
 | `[permission].mode` | `whitelist`（默认，仅名单内可用）或 `blacklist`（名单内不可用，其余放行） |
 | `[permission].allowed_users` | 白名单用户 ID，留空且白名单模式=拒绝所有人 |

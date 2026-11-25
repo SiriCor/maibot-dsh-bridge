@@ -1,31 +1,34 @@
-"""麦麦 × DeepSeek Harness (dsh) 桥插件（带任务守卫 + 精简转发回传）。
+"""麦麦 × DeepSeek Harness (dsh) 桥插件（带任务守卫 + 最终结果直发）。
 
 作用：把 DeepSeek Harness (dsh) 接入麦麦。
   - 命令 `/dsh [--timeout 秒] <任务>`：把任务外包给 dsh，结果回传当前聊天流。
   - 工具 `dsh_run`：让麦麦（Planner）在聊天中自主把重活交给 dsh（自主下单）。
 
 执行模型（异步 + 守卫）：
-  - 异步：命令立即回执，dsh 在后台跑，完成后主动把结果推回群里（绕开宿主 60s RPC 超时）。
-  - 单并发：同一时刻只允许一个 dsh 任务。
+  - 桌面模式：提交只等待任务落盘；独立通知循环领取结果，与下单调用解耦。
+  - 单并发执行：桌面宿主可排队多个任务；CLI 同时只接受一个任务。
   - 强制超时：任务必须带超时，桥校验在 [timeout_min, timeout_max] 内。
   - 进展判据（三信号）：输出 / 进程 CPU 活跃 / 子进程存在，任一有变化即续命。
   - 重复检测：输出原地复读超阈值 → 判定卡循环，终止。
   - 总硬上限：即使一直在动，也不超过声明的 timeout。
   - 分层终止：先温和 terminate，宽限期后 taskkill /T /F 杀整棵进程树。
 
-回传形态（所有内容收进转发，外部不刷屏）：
-  - dsh 以 --json 输出结构化事件，桥逐事件解析。
-  - 外部：只发一句极简状态（完成 / 超时原因）。
-  - 转发：一条合并转发卡片，节点精简——
-      * 工具调用 = 一行「工具名 + 关键参数」（去掉 JSON 壳）
-      * 连续文本输出合并为一段
-      * 工具报错才保留一条
-      * 最终答案一个节点
-  - 这样群里只见「一句状态 + 一张卡片」，永不刷屏。
+回传形态（只回答结果）：
+  - CLI 与桌面模式均静默执行，不发送接单、进度、完成通知或过程转发。
+  - 成功时直接发送最终答案与交付文件，失败时发送实际错误原因。
+  - 桌面通知回灌只记录请求结果，不触发额外 Planner 回复。
 """
 from __future__ import annotations
 
+from pathlib import Path
+from typing import Any, Dict, Literal, Optional
+
+from maibot_sdk import Command, Field, MaiBotPlugin, PluginConfigBase, Tool
+from maibot_sdk.types import ToolParameterInfo, ToolParamType
+
 import asyncio
+import base64
+import importlib.util
 import json
 import os
 import re
@@ -38,11 +41,6 @@ import threading
 import time
 import uuid
 import zipfile
-from pathlib import Path
-from typing import Any, Literal, Optional
-
-from maibot_sdk import Command, Field, MaiBotPlugin, PluginConfigBase, Tool
-from maibot_sdk.types import ToolParameterInfo, ToolParamType
 
 try:  # 进程脉搏（可选，缺失则退化为“仅输出/子进程”判据）
     import psutil  # type: ignore
@@ -60,7 +58,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="0.6.1", description="配置版本")
+    config_version: str = Field(default="0.8.0", description="配置版本")
 
 
 class DshConfig(PluginConfigBase):
@@ -81,6 +79,9 @@ class DshConfig(PluginConfigBase):
     max_forward_nodes: int = Field(default=40, description="合并转发最多节点数（超出则折叠中段）", ge=3, le=200)
     node_max_chars: int = Field(default=1500, description="单个转发节点最大字符数", ge=100, le=8000)
     display_mode: str = Field(default="forward", description="回传形态：forward=合并转发 / text=纯文本")
+    receipt_format: Literal["card", "text"] = Field(
+        default="text", description="最终回执：card=Markdown 排版图片卡片，text=可复制的纯文本"
+    )
     deliver_max_files: int = Field(default=8, description="单次任务最多打包发送的交付物文件数", ge=1, le=50)
     api_key_env: str = Field(default="DEEPSEEK_API_KEY", description="存放 API Key 的环境变量名")
     api_key: str = Field(default="", description="DeepSeek API Key（明文，留空则用系统环境变量；勿分享本文件）")
@@ -127,10 +128,34 @@ class PermissionConfig(PluginConfigBase):
     )
 
 
+class DesktopConfig(PluginConfigBase):
+    __ui_label__ = "桌面宿主"
+    __ui_icon__ = "monitor"
+    __ui_order__ = 3
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "任务是否改走已运行的 DSH Desktop 宿主（需先安装宿主桥插件）。"
+            "开=复用宿主会话与桌面端配置；关=沿用每次起 dsh CLI 进程的旧行为"
+        ),
+    )
+    endpoint_file: str = Field(
+        default="",
+        description="宿主桥写的 endpoint.json 路径（含 host/port；留空则桌面模式直接报配置错误）",
+    )
+    token_file: str = Field(
+        default="",
+        description="宿主桥的 bearer token 文件路径（64 位十六进制；留空则桌面模式直接报配置错误）",
+    )
+    sender: str = Field(default="maibot", description="提交方标识，须与宿主桥配置里的 senderId 一致")
+
+
 class DshBridgeConfig(PluginConfigBase):
     plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
     dsh: DshConfig = Field(default_factory=DshConfig)
     permission: PermissionConfig = Field(default_factory=PermissionConfig)
+    desktop: DesktopConfig = Field(default_factory=DesktopConfig)
 
 
 class _RunState:
@@ -140,6 +165,8 @@ class _RunState:
         self.lock = threading.Lock()
         self.events: list[dict[str, Any]] = []
         self.final_text = ""
+        self.deliverables: list[str] = []
+        self.silent = False
         self.last_progress = time.time()
         self.repeat_line: Optional[str] = None
         self.repeat_count = 0
@@ -194,9 +221,16 @@ class _RunState:
         with self.lock:
             return self.final_text
 
+    def deliverable_copy(self) -> list[str]:
+        with self.lock:
+            return list(self.deliverables)
+
 
 class DshBridgePlugin(MaiBotPlugin):
     config_model = DshBridgeConfig
+
+    _MAX_IMAGE_BYTES = 8 * 1024 * 1024
+    _DESKTOP_SCHEDULE_CONCURRENCY = 4
 
     async def on_load(self) -> None:
         self._running = False
@@ -207,7 +241,13 @@ class DshBridgePlugin(MaiBotPlugin):
         self._schedule_wakeup = asyncio.Event()
         self._scheduled_runs: dict[str, asyncio.Task[None]] = {}
         await asyncio.to_thread(self._load_tasks)
+        self._desktop_client = await asyncio.to_thread(self._desktop_transport)
+        self._delivery_progress = await asyncio.to_thread(self._load_delivery_progress)
+        self._receipt_prompt = await asyncio.to_thread(
+            (Path(__file__).parent / "prompts" / "receipt.zh-CN.prompt").read_text, encoding="utf-8"
+        )
         self._scheduler_task = asyncio.create_task(self._scheduler_loop())
+        self._notification_task = asyncio.create_task(self._notification_loop())
         self.ctx.logger.info(
             "麦麦×dsh 桥插件已加载 (command=%s, timeout=%s~%s, display=%s)",
             self.config.dsh.command,
@@ -218,11 +258,13 @@ class DshBridgePlugin(MaiBotPlugin):
 
     async def on_unload(self) -> None:
         self._scheduler_running = False
+        self._notification_task.cancel()
         self._scheduler_task.cancel()
-        await asyncio.gather(self._scheduler_task, return_exceptions=True)
+        await asyncio.gather(self._notification_task, self._scheduler_task, return_exceptions=True)
         runs = tuple(self._scheduled_runs.values())
-        for run in runs:
-            run.cancel()
+        if not self.config.desktop.enabled:
+            for run in runs:
+                run.cancel()
         await asyncio.gather(*runs, return_exceptions=True)
         pid = self._current_pid
         if pid:
@@ -353,7 +395,9 @@ class DshBridgePlugin(MaiBotPlugin):
                 pass
 
     def _dispatch_due_tasks(self, now: float) -> None:
-        if self._scheduled_runs:
+        limit = self._DESKTOP_SCHEDULE_CONCURRENCY if self.config.desktop.enabled else 1
+        available = limit - len(self._scheduled_runs)
+        if available <= 0:
             return
         due = []
         for task_id, task in self._tasks.items():
@@ -362,8 +406,7 @@ class DshBridgePlugin(MaiBotPlugin):
             next_at = float(task.get("next_at") or 0)
             if 0 < next_at <= now:
                 due.append((next_at, task_id))
-        if due:
-            _, task_id = min(due)
+        for _, task_id in sorted(due)[:available]:
             self._scheduled_runs[task_id] = asyncio.create_task(self._run_scheduled_task(task_id))
 
     async def _run_scheduled_task(self, task_id: str) -> None:
@@ -383,21 +426,26 @@ class DshBridgePlugin(MaiBotPlugin):
         prompt = str(task.get("prompt") or "")
         ctx = task.get("ctx") or {}
         title = str(task.get("title") or "定时任务")
+        desktop_enabled = self.config.desktop.enabled
         if self._reject_busy():
             # 正忙：顺延 60s 后再试，避免与手动任务打架
             task["next_at"] = time.time() + 60
             self._save_tasks()
             self.ctx.logger.info("定时任务「%s」因忙碌顺延", title)
             return
-        self._running = True
-        try:
-            await self.ctx.send.text(f"⏰ 定时任务「{title}」触发：{prompt[:60]}", stream_id)
-        except Exception:  # noqa: BLE001
-            pass
+        self.ctx.logger.info("定时任务「%s」开始执行", title)
+        if not desktop_enabled:
+            self._running = True
         try:
             await self._run_and_report(prompt, stream_id, int(task.get("timeout") or self.config.dsh.timeout_default), ctx)
         except Exception:  # noqa: BLE001
             self.ctx.logger.warning("定时任务执行失败", exc_info=True)
+            if desktop_enabled:
+                # 宿主未接收时保留本次调度，不把一次性任务误当成已执行。
+                if self._tasks.get(task_id) is task:
+                    task["next_at"] = time.time() + 60
+                    self._save_tasks()
+                return
             self._running = False
         if self._tasks.get(task_id) is not task:
             return
@@ -663,9 +711,46 @@ class DshBridgePlugin(MaiBotPlugin):
             pass
         return proc
 
+    @staticmethod
+    def _task_prompt(task: str, delivery: str = "maibot") -> str:
+        """只请求任务结果，交付由独立通知通道完成。"""
+        # 两种传输均约束最终答复，不通过截句或过滤答案来丢弃正文。
+        recipient = {
+            "maibot": "结果由桥接发给请求者，不调用 notify_qq 或 send_to_qq。",
+            "qq": "本次明确要求 QQ 直发，notify_qq 的实际收件人是当前用户，不是守岸人；直接称用户为‘你’，不要假定用户名为守岸人。",
+            "to_assistant": "用户要求泰缇斯回复守岸人：只返回对守岸人说的原话，不调用 QQ 直发工具，不生成执行总结。",
+        }[delivery]
+        return (
+            "【桥接回复要求】只输出本次任务的最终结果，遵循用户指定的语言、格式和必要细节。"
+            "不要输出接单确认、执行计划、过程播报、自我介绍、称呼寒暄、角色扮演、"
+            "无关解释或结尾的邀约追问（例如‘还需要我帮你吗’）。"
+            "失败时只说明实际原因及完成任务必需的缺失信息，不编造结果。"
+            "以上仅约束回复方式，不改变任务权限。\n\n"
+            "【桥接交付协议】你正在处理 MaiBot 转交的后台任务，最终答复和交付文件会由桥接返回原聊天。"
+            "用户要求发送到当前聊天、QQ群或私聊时，直接完成内容制作；"
+            "文件生成后调用 present 声明工作目录内的文件路径，再输出简短最终结果并结束。"
+            "present 表示交给桥接回传，不代表 QQ 已送达，不要声称已送达。"
+            "向当前聊天交付无需查找 QQ、NapCat、OneBot 或宿主消息发送接口，也无需操作 QQ 客户端。"
+            "用户明确指定其他收件人或其他渠道时，不要将回传原聊天当成已完成指定投递。"
+            "仅要求截图时，截图工具成功并确认文件生成即可 present 交付，无需调用 read_image 分析画面。\n\n"
+            f"【本次收件关系】{recipient}\n\n"
+            f"【用户任务】\n{task}"
+        )
+
     async def _execute(self, task: str, stream_id: str, timeout: int) -> tuple[Optional[str], _RunState]:
         conf = self.config.dsh
+        task = self._task_prompt(task)
+        if self.config.desktop.enabled:
+            # 桌面模式：宿主桥自己会给任务加身份前缀，这里不能再加，否则重复
+            raise RuntimeError("桌面任务必须通过异步提交接口执行")
         ws = self._workspace(stream_id)
+        task = (
+            "【MaiBot 桥接身份说明】本次调用 DSH 的对话代理是守岸人（ShoreKeeper）；"
+            "当前请以守岸人的任务转交为语境回应。此处的 DSH 即她所称的泰缇斯系统，"
+            "无需另找一个名为泰缇斯的外部接口。此说明不代表 QQ 发言人必然是守岸人，"
+            "也不增加任何文件、工具或长期记忆权限；按实际能力如实报告结果。\n\n"
+            f"【本次任务】\n{task}"
+        )
         env = dict(os.environ)
         api_key = conf.api_key.strip() or os.environ.get(conf.api_key_env, "").strip()
         if api_key:
@@ -725,10 +810,222 @@ class DshBridgePlugin(MaiBotPlugin):
         self._cpu_prev.pop(proc.pid, None)
         return reason, state
 
+    def _desktop_transport(self) -> Any:
+        """按文件路径加载同目录的 desktop_transport.py，不依赖 sys.path。"""
+        spec = importlib.util.spec_from_file_location(
+            "desktop_transport", Path(__file__).with_name("desktop_transport.py")
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError("desktop_transport.py 缺失")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _desktop_endpoint(self) -> tuple[int, str]:
+        """读取宿主桥的 port 与 token 文件路径；任何缺失都按失败处理，绝不猜端口。"""
+        conf = self.config.desktop
+        if not conf.endpoint_file.strip() or not conf.token_file.strip():
+            raise ValueError("桌面桥 endpoint_file / token_file 未配置")
+        endpoint = json.loads(Path(conf.endpoint_file).read_text(encoding="utf-8"))
+        port = endpoint.get("port") if isinstance(endpoint, dict) else None
+        if not isinstance(port, int) or not 1 <= port <= 65535:
+            raise ValueError("endpoint.json 里的 port 无效")
+        if endpoint.get("version") != 2:
+            raise ValueError("DSH 宿主桥接需要升级到异步通知协议 v2")
+        return port, conf.token_file
+
+    def _desktop_stream(self, stream_id: str) -> str:
+        """把流 ID 收敛成宿主桥接受的 [A-Za-z0-9_-]{1,96}。"""
+        safe = re.sub(r"[^A-Za-z0-9_-]", "_", stream_id or "").strip("_")
+        return safe[:96] or "default"
+
+    async def _submit_desktop(
+        self, task: str, stream_id: str, timeout: int, context: Dict[str, str], delivery: str = "maibot"
+    ) -> Dict[str, Any]:
+        """只等待 DSH 将任务持久化，不等待任务完成。"""
+        port, token_file = await asyncio.to_thread(self._desktop_endpoint)
+        return await asyncio.to_thread(
+            self._desktop_client.submit_task,
+            port=port, token_file=token_file, sender=self.config.desktop.sender,
+            stream=self._desktop_stream(stream_id), stream_id=stream_id, context=context,
+            task=task, timeout=timeout, delivery=delivery,
+        )
+
+    def _delivery_file(self) -> Path:
+        return Path(self.ctx.paths.data_dir) / "desktop_delivery_progress.json"
+
+    def _load_delivery_progress(self) -> Dict[str, Dict[str, Any]]:
+        path = self._delivery_file()
+        if not path.exists():
+            return {}
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("桥接通知发送进度文件损坏")
+        return data
+
+    async def _checkpoint_delivery(self, job_id: str, progress: Optional[Dict[str, Any]]) -> None:
+        updated = dict(self._delivery_progress)
+        if progress is None:
+            updated.pop(job_id, None)
+        else:
+            updated[job_id] = dict(progress)
+
+        def save() -> None:
+            path = self._delivery_file()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(updated, ensure_ascii=False), encoding="utf-8")
+            temporary.replace(path)
+
+        await asyncio.to_thread(save)
+        self._delivery_progress = updated
+
+    @staticmethod
+    def _notification_body(item: Dict[str, Any]) -> str:
+        """用已确认的交付状态组织回执，不能把 DSH 执行说明当成守岸人的发言。"""
+        if item["status"] != "completed":
+            return item["error"]
+        qq_status = item.get("qqDelivery", "none")
+        if qq_status == "sent":
+            return "泰缇斯已经把内容通过 QQ 发给你了。"
+        if qq_status == "queued":
+            return "泰缇斯的回复已在 QQ 通道排队，待你下次发送消息时补发。"
+        if qq_status == "accepted":
+            return "泰缇斯的回复已交给 QQ 通道发送。"
+        if item.get("delivery") == "qq":
+            return "泰缇斯尚未确认 QQ 回复已发送。"
+        raise ValueError("普通任务结果必须经过 MaiBot 回复模型，不能直接转发")
+
+    async def _deliver_notification(self, item: Dict[str, Any], port: int, token_file: str) -> None:
+        """逐段保存已发送进度；全部发送成功后才确认领取。"""
+        job_id, stream_id = item["jobId"], item["streamId"]
+        progress = dict(self._delivery_progress.get(job_id, {}))
+        # 先投递附件，随后组织回执，避免尚未发送成功就声称“发给你了”。
+        for index in range(progress.get("files", 0), len(item["files"])):
+            path = item["files"][index]
+            if Path(path).suffix.lower() in self._IMAGE_SUFFIXES:
+                sent = await self._send_image_file(path, stream_id)
+            else:
+                sent = await self._send_result_file(path, item["context"])
+            if not sent:
+                raise RuntimeError(f"桥接交付文件未发送成功：{Path(path).name}")
+            progress["files"] = index + 1
+            await self._checkpoint_delivery(job_id, progress)
+        if "body" not in progress:
+            progress["body"] = await self._compose_receipt(item)
+            progress["receipt_format"] = self.config.dsh.receipt_format
+            progress["part_chars"] = self.config.dsh.max_output_chars
+            # 重试与重启沿用同一版回执，不能重新生成后按旧分段进度跳过正文。
+            await self._checkpoint_delivery(job_id, progress)
+        body = progress["body"]
+        # 老版本已在发送的回执继续用文字；新回执固定格式和分段大小，重启后不会错位。
+        receipt_format = progress.get("receipt_format", "text")
+        width = progress.get("part_chars", self.config.dsh.max_output_chars)
+        parts = await self._receipt_parts(body, receipt_format, width)
+        for index in range(progress.get("text_parts", 0), len(parts)):
+            await self._send_receipt_part(parts[index], stream_id, receipt_format)
+            progress["text_parts"] = index + 1
+            await self._checkpoint_delivery(job_id, progress)
+        if body and not progress.get("recorded"):
+            # 被动写入请求结果，不触发 Planner，也不附加接单、完成或闲聊指令。
+            await self.ctx.maisaka.context.append(
+                stream_id, segments=[{"type": "text", "content": body}], source_kind="dsh-bridge-result"
+            )
+            progress["recorded"] = True
+            await self._checkpoint_delivery(job_id, progress)
+        await asyncio.to_thread(
+            self._desktop_client.acknowledge, port=port, token_file=token_file, job_id=job_id
+        )
+        await self._checkpoint_delivery(job_id, None)
+
+    @staticmethod
+    def _render_receipt_cards(body: str) -> list[str]:
+        # 插件由文件路径加载，不假定插件目录位于 sys.path。
+        spec = importlib.util.spec_from_file_location(
+            "dsh_receipt_card", Path(__file__).with_name("receipt_card.py")
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError("receipt_card.py 缺失")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.render_cards(body)
+
+    async def _receipt_parts(self, body: str, receipt_format: str, width: int) -> list[str]:
+        if not body:
+            return []
+        if receipt_format == "card":
+            # 字体、Markdown 和 PNG 编码均在线程内完成，避免阻塞 bot 事件循环。
+            return await asyncio.to_thread(self._render_receipt_cards, body)
+        return [body[offset:offset + width] for offset in range(0, len(body), width)]
+
+    async def _send_receipt_part(self, part: str, stream_id: str, receipt_format: str) -> None:
+        if receipt_format == "card":
+            sent = await self.ctx.send.image(part, stream_id)
+        else:
+            sent = await self.ctx.send.text(part, stream_id)
+        if not sent:
+            raise RuntimeError("桥接结果回执未发送成功")
+
+    async def _compose_receipt(self, item: Dict[str, Any]) -> str:
+        """普通任务必须经过 MaiBot 的回复模型，不允许失败后转发执行器原文。"""
+        if (item["status"] != "completed" or item.get("qqDelivery", "none") != "none"
+                or item.get("delivery") == "qq"):
+            return self._notification_body(item)
+        nickname, personality, reply_style = await asyncio.gather(
+            self.ctx.config.get("bot.nickname"),
+            self.ctx.config.get("personality.personality"),
+            self.ctx.config.get("personality.reply_style"),
+        )
+        if not all(isinstance(value, str) for value in (nickname, personality, reply_style)):
+            raise ValueError("无法读取 MaiBot 的人设与回复风格")
+        prompt = self._receipt_prompt.format(
+            nickname=nickname, personality=personality, reply_style=reply_style
+        )
+        result = await asyncio.wait_for(
+            self.ctx.llm.generate(
+                task_name="replyer",
+                prompt=[
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": json.dumps({
+                        "request": item.get("request", ""), "result": item["final"],
+                        "delivery": item.get("delivery", "maibot"),
+                        "files_delivered": [Path(path).name for path in item["files"]],
+                    }, ensure_ascii=False)},
+                ],
+            ), timeout=45,
+        )
+        if result.get("success") is not True:
+            raise RuntimeError("MaiBot 桥接回执生成失败：" + str(result.get("error", "模型调用失败")))
+        body = result.get("response")
+        if not isinstance(body, str) or not body.strip():
+            raise RuntimeError("MaiBot 桥接回执为空")
+        return body.strip()
+
+    async def _notification_loop(self) -> None:
+        last_error = ""
+        while self._scheduler_running:
+            try:
+                if self.config.desktop.enabled:
+                    port, token_file = await asyncio.to_thread(self._desktop_endpoint)
+                    item = await asyncio.to_thread(
+                        self._desktop_client.get_notification, port=port, token_file=token_file
+                    )
+                    if item is not None:
+                        await self._deliver_notification(item, port, token_file)
+                last_error = ""
+            except Exception as exc:  # noqa: BLE001
+                error = str(exc)
+                if error != last_error:
+                    self.ctx.logger.warning("DSH 独立通知处理失败：%s", error, exc_info=True)
+                last_error = error
+            await asyncio.sleep(2)
+
     _REASON_MSG = {
         "timeout": "⏱ dsh 任务达到声明的超时时间，已终止。",
         "stalled": "🛑 dsh 无进展（无输出且进程静默）超过心跳阈值，已终止。",
         "loop": "🔁 dsh 输出疑似陷入循环（重复度过高），已终止。",
+        "desktop-config": "⚙ 桌面桥未配置或宿主未启动，任务未发出。",
+        "desktop-error": "❌ 桌面桥任务失败。",
     }
 
     @staticmethod
@@ -897,70 +1194,108 @@ class DshBridgePlugin(MaiBotPlugin):
             return
         limit = int(self.config.dsh.context_inject_chars)
         if len(final_text) > limit:
-            body = final_text[:limit].rstrip() + "…（完整结果见群内文件/转发）"
+            body = final_text[:limit].rstrip() + "…（完整结果已由桥接直接发送）"
         else:
             body = final_text
         try:
             await self.ctx.maisaka.context.append(
                 stream_id,
-                segments=[{"type": "text", "content": f"【dsh 任务完成】\n{body}"}],
+                segments=[{"type": "text", "content": f"【dsh 结果记录：已直接发送给用户，无需重复回复、转述、确认或追加闲聊】\n{body}"}],
                 source_kind="dsh-bridge",
             )
         except Exception as exc:  # noqa: BLE001
             self.ctx.logger.warning("回灌结果给麦麦失败：%s", exc)
 
     async def _report(self, state: _RunState, reason: Optional[str], stream_id: str, ctx: Optional[dict[str, Any]] = None) -> None:
+        # 两种传输共用结果发送链路，不另发状态、过程转发或重复的结果文件。
+        if not self.config.desktop.enabled and not reason:
+            state.deliverables = await asyncio.to_thread(
+                self._collect_deliverables, state, self._workspace(stream_id)
+            )
+        await self._report_desktop(state, reason, stream_id, ctx)
+
+    # ── 最终结果回传：静默执行，完成后直发文字 + 交付物 ──────────
+
+    _IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
+
+    @staticmethod
+    def _raw_error_text(state: _RunState) -> str:
+        """把执行期记录的错误行拼成一句人话（失败回执用）。"""
+        lines: list[str] = []
+        for evt in state.events_copy():
+            if str(evt.get("type") or "") == "raw":
+                text = str(evt.get("text") or "").strip()
+                if text and text not in lines:
+                    lines.append(text)
+        return "；".join(lines)[:600]
+
+    async def _send_image_file(self, path: str, stream_id: str) -> bool:
+        """把本地图片文件读成 base64 后直接以图片消息发出。"""
+
+        def read_image() -> Optional[str]:
+            fp = Path(path)
+            if not fp.is_file():
+                return None
+            if fp.stat().st_size > self._MAX_IMAGE_BYTES:
+                return None
+            return base64.b64encode(fp.read_bytes()).decode("ascii")
+
+        try:
+            data = await asyncio.to_thread(read_image)
+            if data is None:
+                return False
+        except Exception:  # noqa: BLE001
+            self.ctx.logger.warning("读取图片失败：%s", path, exc_info=True)
+            return False
+        try:
+            return bool(await self.ctx.send.image(data, stream_id))
+        except Exception:  # noqa: BLE001
+            self.ctx.logger.warning("发送图片失败：%s", path, exc_info=True)
+            return False
+
+    async def _report_desktop(
+        self, state: _RunState, reason: Optional[str], stream_id: str, ctx: Optional[dict[str, Any]] = None
+    ) -> None:
+        """唯一结果回执：成功时直发最终文字与交付物；失败时只发实际原因。"""
         conf = self.config.dsh
-        header = self._REASON_MSG.get(reason or "", "")
         final_text = state.final_copy().strip()
-        use_forward = conf.display_mode.strip().lower() != "text"
-        nodes = self._build_forward_nodes(state) if use_forward else []
 
-        # 外部只留一句极简状态：所有内容收进转发，避免被判刷屏/重复
-        if header:
-            receipt = header
-        elif nodes:
-            receipt = "✅ dsh 任务完成（过程见转发）"
-        else:
-            receipt = final_text[: conf.max_output_chars] if final_text else "(dsh 无输出)"
+        if reason:
+            header = self._REASON_MSG.get(reason, "❌ dsh 任务失败。")
+            detail = self._raw_error_text(state)
+            body = f"dsh：{header}" + (f"\n{detail}" if detail else "")
+            try:
+                await self.ctx.send.text(body[: conf.max_output_chars], stream_id)
+            except Exception:  # noqa: BLE001
+                self.ctx.logger.warning("dsh 失败回执发送失败", exc_info=True)
+            return
 
-        try:
-            await self.ctx.send.text(f"dsh：{receipt}", stream_id)
-        except Exception:  # noqa: BLE001
-            self.ctx.logger.warning("dsh 回执发送失败", exc_info=True)
+        if final_text:
+            parts = await self._receipt_parts(final_text, conf.receipt_format, conf.max_output_chars)
+            for part in parts:
+                await self._send_receipt_part(part, stream_id, conf.receipt_format)
 
-        # 结果写文件并发送（NapCat 专属；其他适配器自动回退）+ 回灌给麦麦
-        try:
-            file_path = self._write_result_file(state)
-            if file_path:
-                if await self._send_result_file(file_path, ctx or {}):
-                    await self.ctx.send.text(f"📎 结果文件：{Path(file_path).name}", stream_id)
-        except Exception:  # noqa: BLE001
-            self.ctx.logger.warning("结果文件处理失败", exc_info=True)
+        # 图片直接发；非图片交付物仍走 NapCat 文件上传（非 NapCat 适配器自动跳过）
+        files = state.deliverable_copy()
+        limit = int(conf.deliver_max_files)
+        for path in files[:limit]:
+            suffix = Path(path).suffix.lower()
+            if suffix in self._IMAGE_SUFFIXES and await self._send_image_file(path, stream_id):
+                continue
+            try:
+                await self._send_result_file(path, ctx or {})
+            except Exception:  # noqa: BLE001
+                self.ctx.logger.warning("发送交付物失败：%s", path, exc_info=True)
+        if not final_text and not files:
+            try:
+                await self.ctx.send.text("dsh：(任务已完成，但没有任何输出)", stream_id)
+            except Exception:  # noqa: BLE001
+                pass
 
         try:
             await self._notify_bot(state, stream_id)
         except Exception:  # noqa: BLE001
             self.ctx.logger.warning("回灌结果失败", exc_info=True)
-
-        # 交付物：present 声明的文件 → 打包/发送（NapCat 专属，非 NapCat 自动跳过）
-        try:
-            await self._send_deliverables(state, stream_id, ctx or {})
-        except Exception:  # noqa: BLE001
-            self.ctx.logger.warning("交付物处理失败", exc_info=True)
-
-        if not nodes:
-            return
-        try:
-            await self.ctx.send.forward(nodes, stream_id)
-        except Exception:  # noqa: BLE001
-            self.ctx.logger.warning("dsh 转发发送失败", exc_info=True)
-            # 兜底：转发失败时把最终答案补发出来（仅此一次，避免重复刷屏）
-            if final_text:
-                try:
-                    await self.ctx.send.text(final_text[: conf.max_output_chars], stream_id)
-                except Exception:  # noqa: BLE001
-                    pass
 
     def _collect_deliverables(self, state: _RunState, ws: str) -> list[str]:
         """从 dsh 事件流里收集 present 声明的交付文件（绝对路径，仅保留存在的）。"""
@@ -1101,9 +1436,13 @@ class DshBridgePlugin(MaiBotPlugin):
         return plan, secs
 
     async def _run_and_report(self, task: str, stream_id: str, timeout: int, ctx: Optional[dict[str, Any]] = None) -> None:
+        if self.config.desktop.enabled:
+            # 桌面模式跳过规划轮，由宿主独立执行和通知，提交方不等待结果。
+            await self._submit_desktop(task, stream_id, timeout, ctx or {})
+            return
         before = self._scan_plugin_dirs(stream_id)
         # 第一轮：dsh 自评，定操作计划与最长时长（发起方 timeout 仅作参考）
-        plan, timeout = await self._plan_task(task, stream_id, timeout)
+        _plan, timeout = await self._plan_task(task, stream_id, timeout)
         try:
             reason, state = await self._execute(task, stream_id, timeout)
         except Exception as exc:  # noqa: BLE001
@@ -1128,7 +1467,7 @@ class DshBridgePlugin(MaiBotPlugin):
             self.ctx.logger.warning("处理定时任务请求失败", exc_info=True)
 
     def _reject_busy(self) -> bool:
-        return self._running
+        return not self.config.desktop.enabled and self._running
 
     # ── 命令：/dsh ────────────────────────────────────────────
 
@@ -1168,10 +1507,16 @@ class DshBridgePlugin(MaiBotPlugin):
             return False, "忙碌", False
 
         to = self._clamp_timeout(timeout)
+        if self.config.desktop.enabled:
+            try:
+                accepted = await self._submit_desktop(body, stream_id, to, self._extract_ctx(kwargs))
+            except Exception as exc:  # noqa: BLE001
+                self.ctx.logger.warning("DSH 任务提交失败：%s", exc, exc_info=True)
+                await self.ctx.send.text("DSH 任务提交失败，请检查桥接日志。", stream_id)
+                return False, "提交失败", False
+            return True, accepted["jobId"], False
         self._running = True
-        await self.ctx.send.text(
-            f"🛠 已把任务交给 dsh（超时 {to}s）：{body[:80]}", stream_id
-        )
+        # 提交后静默，完成时由结果发送链路统一回复。
         asyncio.create_task(self._run_and_report(body, stream_id, to, self._extract_ctx(kwargs)))
         return True, "已提交", False
 
@@ -1181,14 +1526,14 @@ class DshBridgePlugin(MaiBotPlugin):
         "dsh_run",
         description=(
             "把较重任务外包给 dsh 在服务器执行（写插件 / 跑脚本 / 深度调研）。需给 timeout_seconds（预计秒数，仅作参考）。"
-            "仅当任务明显超出即时聊天能力时使用。"
+            "仅当任务明显超出即时聊天能力时使用。提交即返回任务编号，无需等待或轮询；DSH 通过独立通知发送请求结果。不要另发接单、进度、转述或闲聊。"
         ),
         visibility="visible",
         parameters=[
             ToolParameterInfo(
                 name="task",
                 param_type=ToolParamType.STRING,
-                description="要 dsh 完成的任务描述",
+                description="要 dsh 完成的任务描述。delivery=qq 时让 DSH 用 notify_qq 发送文字及文件，不用 present 代替发送；其他模式的文件用 present 交给桥接。",
                 required=True,
             ),
             ToolParameterInfo(
@@ -1197,12 +1542,21 @@ class DshBridgePlugin(MaiBotPlugin):
                 description="预计所需秒数（参考值）",
                 required=True,
             ),
+            ToolParameterInfo(
+                name="delivery",
+                param_type=ToolParamType.STRING,
+                description="qq=用户明确说‘让泰提斯/泰缇斯/Tethys系统发给我、把截图/文件发给我、回复我’，必须由 DSH 调用 notify_qq，随后只通知守岸人发送状态；用户不需要说出工具名。to_assistant=让泰缇斯回复你/守岸人；maibot=普通任务由守岸人交付结果。不要混淆‘回复我’与‘回复你’。",
+                required=True,
+            ),
         ],
     )
     async def _tool_dsh_run(self, **kwargs: Any) -> dict[str, Any]:
         task = str(kwargs.get("task") or "").strip()
         stream_id = str(kwargs.get("stream_id") or "").strip()
         raw_timeout = kwargs.get("timeout_seconds")
+        delivery = str(kwargs.get("delivery") or "maibot")
+        if delivery not in {"maibot", "qq", "to_assistant"}:
+            return {"success": False, "error": "delivery 必须为 maibot、qq 或 to_assistant"}
 
         if not self.config.plugin.enabled:
             return {"success": False, "error": "插件未启用"}
@@ -1216,12 +1570,26 @@ class DshBridgePlugin(MaiBotPlugin):
             return {"success": False, "error": "已有 dsh 任务在执行"}
 
         to = self._clamp_timeout(int(raw_timeout))
+        if self.config.desktop.enabled:
+            try:
+                accepted = await self._submit_desktop(task, stream_id, to, self._extract_ctx(kwargs), delivery)
+            except Exception as exc:  # noqa: BLE001
+                self.ctx.logger.warning("DSH 任务提交失败：%s", exc, exc_info=True)
+                return {"success": False, "error": "DSH 任务提交失败，请检查桥接日志。"}
+            return {
+                "success": True, "accepted": True, "status": "queued", "job_id": accepted["jobId"],
+                "message": "任务已由 DSH 持久化接收。请结束本轮，无需等待、轮询或回复；结果通过独立通知发送，只包含请求的结果内容。",
+            }
         self._running = True
-        await self.ctx.send.text(
-            f"🛠 已把任务交给 dsh（超时 {to}s）：{task[:80]}", stream_id
-        )
+        # 提交后静默，完成时由结果发送链路统一回复。
         asyncio.create_task(self._run_and_report(task, stream_id, to, self._extract_ctx(kwargs)))
-        return {"success": True, "accepted": True, "timeout_seconds": to}
+        return {
+            "success": True,
+            "accepted": True,
+            "status": "running",
+            "timeout_seconds": to,
+            "message": "任务正在后台执行，此处不是任务结果。请结束本轮，不要调用回复工具发送接单确认、进度或闲聊；桥接会直接发送最终结果，无需重复转述。",
+        }
 
     # ── 工具：定时任务（供 Planner 建/看/删） ────────────────
 

@@ -1,6 +1,6 @@
 [plugin]
 enabled = true
-config_version = "0.6.1"
+config_version = "0.8.0"
 
 [dsh]
 # dsh 可执行命令（装好后通常是 dsh；Windows 全局装可能在 C:\nodejs\dsh.cmd）
@@ -26,6 +26,8 @@ max_forward_nodes = 40
 node_max_chars = 1500
 # 回传形态：forward=合并转发 / text=纯文本
 display_mode = "forward"
+# 最终回执：card=Markdown 排版图片卡片；text=可复制纯文本（默认）
+receipt_format = "text"
 # 回灌进麦麦上下文的结果摘要上限（越小越省上下文）
 context_inject_chars = 600
 # 单次任务最多打包发送的交付物数量
@@ -53,3 +55,10 @@ blocked_users = ""
 blocked_groups = ""
 # 是否对 dsh_run / schedule_* 工具也施加名单（关=工具面放开，风险自负）
 enforce_tools = true
+
+[desktop]
+# 桌面模式使用异步提交 + 独立通知，需要部署 desktop_host/ 的宿主模块（协议 v2）
+enabled = false
+endpoint_file = ""
+token_file = ""
+sender = "maibot"
